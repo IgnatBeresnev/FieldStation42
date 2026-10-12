@@ -111,6 +111,16 @@ async function fetchStationSummary() {
     }
 }
 
+
+async function fetchChannels() {
+    try {
+        const resp = await window.fs42Api.get('summary/channels');
+        return resp.channels || [];
+    } catch (e) {
+        return [];
+    }
+}
+
 // Fetch catalog for a station
 async function fetchCatalog(networkId) {
     try {
@@ -183,17 +193,34 @@ async function fetchScheduleSummary(networkId) {
 }
 
 // Fetch schedule blocks for a station and date range
-async function fetchSchedule(networkId, start, end) {
+async function fetchSchedule(networkId, start, end, includeMeta) {
     try {
         let url = `schedules/${networkId}`;
         const params = [];
         if (start) params.push(`start=${encodeURIComponent(start)}`);
         if (end) params.push(`end=${encodeURIComponent(end)}`);
+        if (includeMeta) params.push('include_meta=true');
         if (params.length) url += `?${params.join('&')}`;
         const resp = await window.fs42Api.get(url);
         return resp.schedule_blocks || [];
     } catch (e) {
         return [];
+    }
+}
+
+
+async function fetchGuideSchedules(start, end, includeMeta) {
+    try {
+        let url = 'schedules/all';
+        const params = [];
+        if (start) params.push(`start=${encodeURIComponent(start)}`);
+        if (end) params.push(`end=${encodeURIComponent(end)}`);
+        if (includeMeta) params.push('include_meta=true');
+        if (params.length) url += `?${params.join('&')}`;
+        const resp = await window.fs42Api.get(url);
+        return resp.schedules || {};
+    } catch (e) {
+        return {};
     }
 }
 
@@ -242,10 +269,12 @@ window.fs42Common = {
     createLogDisplay,
     // API functions
     fetchStationSummary,
+    fetchChannels,
     fetchCatalog,
     renderSummaryTable,
     renderCatalogTable,
     fetchScheduleSummary,
     fetchSchedule,
+    fetchGuideSchedules,
     renderScheduleTable
 };

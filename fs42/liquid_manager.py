@@ -61,12 +61,11 @@ class LiquidManager(object):
                 LiquidAPI.delete_blocks(station_config)
         self.reload_schedules()
 
-    def reset_schedule(self, station_config, force=False):
+    def reset_schedule(self, station_config):
         
         if station_config["_has_schedule"]:
             logging.getLogger("liquid").info(f"Deleting schedules for {station_config['network_name']}")
-            if not force:
-               self.reset_sequences(station_config)
+            self.reset_sequences(station_config)
             LiquidAPI.delete_blocks(station_config)
         self.reload_schedules()
 
@@ -78,6 +77,7 @@ class LiquidManager(object):
         _blocks: list[LiquidBlock] = self.schedules.get(station_config["network_name"], [])
 
         now = datetime.datetime.now()
+        today = datetime.datetime(now.year, now.month, now.day)
         _reaped = {}
 
         # make a sequence cache index
@@ -90,7 +90,7 @@ class LiquidManager(object):
 
         for _block in _blocks:
             # are we to now yet?
-            if _block.start_time > now:
+            if _block.start_time >= today:
                 # does it have a sequence and is that sequence in the catalog?
 
                 if _block.sequence_key:
@@ -107,7 +107,6 @@ class LiquidManager(object):
                     if seq and skey not in _reaped:
                         # register that we found it
                         _reaped[skey] = _block
-
                         SequenceAPI.reset_by_episode_path(
                             station_config,
                             _block.sequence_key["sequence_name"],
@@ -198,6 +197,13 @@ class LiquidManager(object):
                 return PlayPoint(found_index, diff.total_seconds(), _block.plan, _block.title)
             current_mark = next_mark
             found_index += 1
+
+        # the plan ran out before the block did - cover the gap with be right back media if the station has it
+        gap = (_block.end_time - when).total_seconds()
+        brb = station_conf.get("be_right_back_media")
+        if brb and gap > 0:
+            return PlayPoint(0, 0, [BlockPlanEntry(brb, 0, gap, content_type="bump")], _block.title)
+        return None
 
     def print_schedule(self, network_name, go_deep=False):
         for _block in self.schedules[network_name]:

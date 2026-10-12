@@ -36,7 +36,7 @@ USE_SYSTEMCTL = True
 # Available key names: 'home', 'end', 'up', 'down', 'left', 'right', 'space', 'enter',
 # 'esc', 'tab', 'backspace', 'delete', 'insert', 'pageup', 'pagedown', 'f1'-'f12',
 # 'a'-'z', 'leftshift', 'rightshift', 'leftctrl', 'rightctrl', 'leftalt', 'rightalt'
-KEY_MAPPINGS = {
+DEFAULT_KEY_MAPPINGS = {
     # Remote control functions
     'show_guide': 'home',        # Show program guide
     'volume_up': 'right',        # Increase volume
@@ -57,6 +57,30 @@ KEY_MAPPINGS = {
     # 'volume_up': 'pageup',     # Use page up for volume up
     # 'volume_down': 'pagedown', # Use page down for volume down
 }
+SETTINGS_FILE = "runtime/remote_controller.json"
+KEY_MAPPINGS = DEFAULT_KEY_MAPPINGS.copy()
+
+if os.path.exists(SETTINGS_FILE):
+    print(f"Loading settings from {SETTINGS_FILE}")
+    try:
+        with open(SETTINGS_FILE, 'r') as file:
+            remote_settings = json.load(file)
+        if remote_settings.get("use_systemctl") is not None:
+            print("Loading USE_SYSTEMCTL from file")
+            USE_SYSTEMCTL = bool(remote_settings["use_systemctl"])
+        if remote_settings.get("systemctl_to_toggle") is not None:
+            print("Loading SYSTEMCTL_TO_TOGGLE from file")
+            SYSTEMCTL_TO_TOGGLE = remote_settings["systemctl_to_toggle"]
+        if remote_settings.get("key_mappings") is not None:
+            print("Loading KEY_MAPPINGS from file")
+            file_mappings = remote_settings["key_mappings"]
+            KEY_MAPPINGS = file_mappings.copy()
+            for function, key in DEFAULT_KEY_MAPPINGS.items():
+                if function not in KEY_MAPPINGS and key not in KEY_MAPPINGS.values():
+                    KEY_MAPPINGS[function] = key
+    except Exception as e:
+        print(f"Error loading settings from file: {e}")
+
 CALLBACK_MAP_FILE = "runtime/remote_callback_map.json"
 PRESS_SOCKET = "runtime/press.socket"
 
@@ -147,10 +171,39 @@ def send_channel_change():
             clear_press_socket()
 
 
+def send_parental_digit_if_active(number):
+    try:
+        status_response = requests.get(f'{FS42_BASE_URL}/player/status', timeout=2)
+        if not status_response.ok:
+            return False
+
+        status = status_response.json()
+        if not status.get("awaiting_pin"):
+            return False
+
+        response = requests.post(
+            f'{FS42_BASE_URL}/player/parental/digit/{number}',
+            timeout=2
+        )
+
+        if response.ok:
+            print(f"Parental controls PIN digit entered: {number}")
+            return True
+
+        print(f"Parental controls digit failed: {response.status_code}")
+        return False
+    except Exception as e:
+        print(f"Parental controls digit error: {e}")
+        return False
+
+
 def number_pressed(number):
     """Handle number key presses from remote"""
     global channel_input, channel_input_timer
-    
+
+    if send_parental_digit_if_active(number):
+        return
+
     with input_lock:
         # Cancel any existing timer
         if channel_input_timer:
@@ -602,6 +655,16 @@ def handle_key_event(event):
         elif key_code == ecodes.KEY_0:
             number_pressed(0)
             return True
+        elif key_code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER):
+            global channel_input_timer
+            with input_lock:
+                confirming = bool(channel_input)
+                if confirming and channel_input_timer:
+                    channel_input_timer.cancel()
+                    channel_input_timer = None
+            if confirming:
+                send_channel_change()
+                return True
 
         # Get the key name and check if it's mapped to a function
         key_name = get_key_name_from_code(key_code)

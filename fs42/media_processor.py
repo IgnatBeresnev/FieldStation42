@@ -37,18 +37,21 @@ from fs42.fluid_objects import FileRepoEntry
 from fs42 import timings
 
 try:
-    # try to import from version > 2.0
-    from moviepy import VideoFileClip
+    try:
+        # try to import from version > 2.0
+        from moviepy import VideoFileClip
+    except ImportError:
+        # fall back to import from version 1.0
+        from moviepy.editor import VideoFileClip  # type: ignore
 except ImportError:
-    # fall back to import from version 1.0
-    from moviepy.editor import VideoFileClip  # type: ignore
+    VideoFileClip = None
 
 try:
     import mutagen
 except ImportError:
     mutagen = None
 
-from fs42.schedule_hint import MonthHint, QuarterHint, RangeHint, BumpHint, DayPartHint, DayofWeekHint
+from fs42 import schedule_hint
 from fs42.catalog_entry import CatalogEntry
 
 
@@ -69,6 +72,21 @@ class MediaProcessor:
             return 'video'
 
     @staticmethod
+    def extract_metadata(file_path: str, media_type: str) -> dict:
+        """Extract normalized metadata for a media file.
+
+        Audio files are read from their embedded tags (ID3/Vorbis/MP4);
+        video files are read from an adjacent Kodi-format .nfo sidecar. Both
+        return a normalized dict carrying a `type` discriminator, or {} when
+        no metadata is available.
+        """
+        if media_type == 'audio':
+            return MediaProcessor.extract_audio_metadata(file_path)
+
+        from fs42.nfo_agent import NFOAgent
+        return NFOAgent.read_metadata_from_disk(file_path) or {}
+
+    @staticmethod
     def extract_audio_metadata(file_path: str) -> dict:
         if mutagen is None:
             logging.getLogger("MEDIA").warning("mutagen library not available, skipping audio metadata extraction")
@@ -79,7 +97,7 @@ class MediaProcessor:
             if audio is None:
                 return {}
 
-            metadata = {}
+            metadata = {"type": "music"}
 
             # Extract common tags - mutagen returns lists for most values
             if hasattr(audio, 'tags') and audio.tags:
@@ -92,7 +110,7 @@ class MediaProcessor:
                     'title': ['TIT2', 'title', '\xa9nam'],
                     'artist': ['TPE1', 'artist', '\xa9ART'],
                     'album': ['TALB', 'album', '\xa9alb'],
-                    'date': ['TDRC', 'date', '\xa9day', 'year'],
+                    'year': ['TDRC', 'date', '\xa9day', 'year'],
                     'genre': ['TCON', 'genre', '\xa9gen']
                 }
 
@@ -117,6 +135,7 @@ class MediaProcessor:
             logging.getLogger("MEDIA").debug(f"Could not extract metadata from {file_path}: {e}")
             # Return basic metadata from filename
             return {
+                'type': 'music',
                 'title': os.path.splitext(os.path.basename(file_path))[0]
             }
 
@@ -139,8 +158,8 @@ class MediaProcessor:
                 # then do the processing
                 duration, error_hint = MediaProcessor._get_duration(fname)
 
-            # it might not support streams, so check with moviepy
-            if duration <= 0.0:
+            # it might not support streams, so check with moviepy (if available)
+            if duration <= 0.0 and VideoFileClip is not None:
                 try:
                     video_clip = VideoFileClip(fname)
                     duration = video_clip.duration
@@ -282,12 +301,28 @@ class MediaProcessor:
         else:  # "mixed"
             formats_to_scan = MediaProcessor.supported_formats
 
-        file_list = []
         # get all the files
-        for ext in formats_to_scan:
-            # this_format = directory.rglob(f"*.{ext}")
-            this_format = glob.glob(f"{path}/**/*.{ext}", recursive=True)
-            file_list += this_format
+        file_list = []
+
+        extensions = {
+            f".{ext.lower()}"
+            for ext in formats_to_scan
+        }
+
+        for root, dirs, files in os.walk(path, followlinks=True):
+            # glob skipped dotfiles - keep doing that so hidden dirs and
+            # macos appledouble sidecars (._foo.mp4) don't get picked up as media
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+
+            for file in files:
+
+                if file.startswith("."):
+                    continue
+
+                if os.path.splitext(file)[1].lower() in extensions:
+                    file_list.append(
+                        os.path.join(root, file)
+                    )
 
         logging.getLogger("MEDIA").debug(f"_rfind_media done scanning {path} {len(file_list)}")
         return file_list
@@ -296,19 +331,12 @@ class MediaProcessor:
     def _process_hints(path, tag, bumpdir=False):
         base = os.path.basename(path)
         hints = []
-        if MonthHint.test_pattern(base):
-            hints.append(MonthHint(base))
-        if QuarterHint.test_pattern(base):
-            hints.append(QuarterHint(base))
-        if RangeHint.test_pattern(base):
-            hints.append(RangeHint(base))
-        if DayPartHint.test_pattern(base):
-            hints.append(DayPartHint(base))
-        if DayofWeekHint.test_pattern(base):
-            hints.append(DayofWeekHint(base))
+        for klass in schedule_hint.FOLDER_HINT_KLASSES:
+            if klass.test_pattern(base):
+                hints.append(klass(base))
         if bumpdir:
-            if BumpHint.test_pattern(base):
-                hints.append(BumpHint(base))
+            if schedule_hint.BumpHint.test_pattern(base):
+                hints.append(schedule_hint.BumpHint(base))
 
         return hints
 
@@ -364,12 +392,12 @@ class MediaProcessor:
         for bump in bumps:
             found = False
             for hint in bump.hints:
-                if type(hint) is BumpHint:
-                    if hint.where == BumpHint.pre:
+                if type(hint) is schedule_hint.BumpHint:
+                    if hint.where == schedule_hint.BumpHint.pre:
                         bump.tag = pre_tag
                         pre.append(bump)
                         found = True
-                    elif hint.where == BumpHint.post:
+                    elif hint.where == schedule_hint.BumpHint.post:
                         bump.tag = post_tag
                         post.append(bump)
                         found = True

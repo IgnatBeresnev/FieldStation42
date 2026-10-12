@@ -8,7 +8,7 @@ from rich.panel import Panel
 from rich import style
 
 from fs42.catalog import ShowCatalog
-from fs42.station_manager import StationManager
+from fs42.station_manager import StationManager, StationConfigError
 from fs42.liquid_manager import LiquidManager
 from fs42.liquid_schedule import LiquidSchedule
 from fs42.fluid_builder import FluidBuilder
@@ -207,7 +207,7 @@ def main():
             if station["_has_schedule"]:
                 _l.info(f"Resetting schedule for {station['network_name']}")
                 try:
-                    LiquidManager().reset_schedule(station, args.force)
+                    LiquidManager().reset_schedule(station)
                     success_messages.append(
                         f"Successfully reset schedule for {station['network_name']}"
                     )
@@ -603,4 +603,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except StationConfigError as e:
+        logging.getLogger("Station42").error(str(e))
+        sys.exit(-1)

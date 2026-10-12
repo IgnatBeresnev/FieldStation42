@@ -8,6 +8,7 @@ import mimetypes
 from fs42.station_manager import StationManager
 from fs42.nfo_agent import NFOAgent
 from .tmdb_helper import get_tmdb_helper
+from .player import connected_command_queue
 
 router = APIRouter(prefix="/ppv", tags=["ppv"])
 
@@ -118,12 +119,13 @@ async def get_ppv_content(channel_number: int, variation: Optional[str] = None):
                 nfo_data = None
                 has_nfo = False
 
-                file_nfo = NFOAgent.read_nfo(file_path)
-                if file_nfo:
+                file_meta = NFOAgent.read_metadata_from_disk(file_path)
+                if file_meta:
+                    fields = NFOAgent.display_fields(file_meta)
                     nfo_data = NFOData(
-                        title=file_nfo.title,
-                        info=file_nfo.info,
-                        description=file_nfo.description,
+                        title=fields["title"],
+                        info=fields["info"],
+                        description=fields["description"],
                     )
                     has_nfo = True
 
@@ -301,8 +303,7 @@ async def play_file(channel_number: int, play_request: PlayFileRequest, request:
             detail=f"File not found: {play_request.file_path}"
         )
 
-    # Get the command queue from app state
-    command_queue = request.app.state.player_command_queue
+    command_queue = connected_command_queue(request)
 
     # Create the command to send to the player
     command = {
@@ -336,7 +337,7 @@ async def send_key(channel_number: int, key_name: str, request: Request):
     allowed_keys = {"PageUp", "PageDown", "Enter"}
     if key_name not in allowed_keys:
         raise HTTPException(status_code=400, detail=f"Key must be one of: {allowed_keys}")
-    command_queue = request.app.state.player_command_queue
+    command_queue = connected_command_queue(request)
     try:
         command_queue.put({"command": "web_key", "key": key_name})
         return {"success": True, "key": key_name}

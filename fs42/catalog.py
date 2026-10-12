@@ -13,15 +13,21 @@ from fs42.liquid_blocks import ReelBlock
 from fs42.media_processor import MediaProcessor
 from fs42.sequence_api import SequenceAPI
 from fs42.autobump_agent import AutoBumpAgent
+from fs42.slot_reader import SlotReader
 
 
 
 try:
-    # try to import from version > 2.0
-    from moviepy import VideoFileClip
+    try:
+        # try to import from version > 2.0
+        from moviepy import VideoFileClip
+    except ImportError:
+        # fall back to import from version 1.0
+        from moviepy.editor import VideoFileClip  # type: ignore
 except ImportError:
-    # fall back to import from version 1.0
-    from moviepy.editor import VideoFileClip  # type: ignore
+    # moviepy not installed at all - it's only used as a fallback duration
+    # probe when ffmpeg.probe() can't determine a file's duration
+    VideoFileClip = None
 
 
 FF_USE_FLUID_FILE_CACHE = True
@@ -59,6 +65,26 @@ class ShowCatalog:
         is a no-op since the set is always empty at process start.
         """  
         cls._fluid_cache_scanned.clear()
+
+    @staticmethod
+    def _get_required_video_duration(path: str) -> float:
+
+        duration, error_hint = MediaProcessor._get_duration(path)
+        if duration > 0.0:
+            return duration
+
+        if VideoFileClip is not None:
+            try:
+                video_clip = VideoFileClip(path)
+                duration = video_clip.duration
+                video_clip.close()
+                if duration and duration > 0.0:
+                    return duration
+            except Exception:
+                pass
+
+        hint = f" ({error_hint})" if error_hint else ""
+        raise RuntimeError(f"Could not determine duration for required video file: {path}{hint}")
 
     def __init__(self, config, rebuild_catalog=False, load=True, debug=False, force=False, skip_chapter_scan=False):
         self.config = config
@@ -156,6 +182,25 @@ class ShowCatalog:
     def _build_tags(self):
         self.tags = list(self.clip_index.keys())
 
+    @staticmethod
+    def _harvest_slot(slot, tags, bump_overrides, commercial_overrides, start_bumps, end_bumps):
+        # collects the tags and directory overrides declared by a single slot
+        if "tags" in slot:
+            if type(slot["tags"]) is list:
+                for tag in slot["tags"]:
+                    tags[tag] = True
+            else:
+                tags[slot["tags"]] = True
+
+        if "bump_dir" in slot:
+            bump_overrides[slot["bump_dir"]] = True
+        if "commercial_dir" in slot:
+            commercial_overrides[slot["commercial_dir"]] = True
+        if "start_bump" in slot:
+            start_bumps[slot["start_bump"]] = True
+        if "end_bump" in slot:
+            end_bumps[slot["end_bump"]] = True
+
     def _build_standard(self):
         self.clip_index = {}
         self.tags = []
@@ -178,22 +223,10 @@ class ShowCatalog:
                     self._l.error(f"Slot value: {slots[k]}")
                     raise TypeError(f"Invalid slot configuration for {day}[{k}]: expected dict, got {type(slots[k]).__name__}. Check media processing logs for errors.")
 
-                if "tags" in slots[k]:
-                    if type(slots[k]["tags"]) is list:
-                        for m in slots[k]["tags"]:
-                            tags[m] = True
-                    else:
-                        tags[slots[k]["tags"]] = True
-
-                # These checks should be outside the tags check - slots can have bump/commercial dirs without tags
-                if "bump_dir" in slots[k]:
-                    bump_overrides[slots[k]["bump_dir"]] = True
-                if "commercial_dir" in slots[k]:
-                    commercial_overrides[slots[k]["commercial_dir"]] = True
-                if "start_bump" in slots[k]:
-                    start_bumps[slots[k]["start_bump"]] = True
-                if "end_bump" in slots[k]:
-                    end_bumps[slots[k]["end_bump"]] = True
+                # note bump/commercial dirs are collected too - slots can have them without tags
+                ShowCatalog._harvest_slot(
+                    slots[k], tags, bump_overrides, commercial_overrides, start_bumps, end_bumps
+                )
         
         # check for tag overrides
         tag_overrides = self.config.get("tag_overrides", {})
@@ -205,32 +238,30 @@ class ShowCatalog:
             if "start_bump" in override:
                 start_bumps[override["start_bump"]] = True
             if "end_bump" in override:
-                end_bumps[override["start_bump"]] = True
+                end_bumps[override["end_bump"]] = True
 
         # check for date override tags
         date_overrides = self.config.get("date_overrides", {})
         for override_slots in date_overrides.values():
-            for slot_key in override_slots:
-                slot = override_slots[slot_key]
-
+            for slot in override_slots.values():
                 if not isinstance(slot, dict):
                     continue
+                ShowCatalog._harvest_slot(
+                    slot, tags, bump_overrides, commercial_overrides, start_bumps, end_bumps
+                )
 
-                if "tags" in slot:
-                    if type(slot["tags"]) is list:
-                        for tag in slot["tags"]:
-                            tags[tag] = True
-                    else:
-                        tags[slot["tags"]] = True
-
-                if "bump_dir" in slot:
-                    bump_overrides[slot["bump_dir"]] = True
-                if "commercial_dir" in slot:
-                    commercial_overrides[slot["commercial_dir"]] = True
-                if "start_bump" in slot:
-                    start_bumps[slot["start_bump"]] = True
-                if "end_bump" in slot:
-                    end_bumps[slot["end_bump"]] = True
+        # check for week override tags
+        week_overrides = self.config.get("week_overrides", {})
+        for week_schedule in week_overrides.values():
+            for day_key in DAYS:
+                if day_key not in week_schedule:
+                    continue
+                for slot in week_schedule[day_key].values():
+                    if not isinstance(slot, dict):
+                        continue
+                    ShowCatalog._harvest_slot(
+                        slot, tags, bump_overrides, commercial_overrides, start_bumps, end_bumps
+                    )
 
         # check for fallback tag
         if "fallback_tag" in self.config:
@@ -246,8 +277,6 @@ class ShowCatalog:
                 tags[self.config["clip_shows"][clip_tag]["end_clip"]] = True
 
         
-
-        SequenceAPI.scan_sequences(self.config)
 
         self.clip_index["start_bumps"] = []
         self.clip_index["end_bumps"] = []
@@ -310,17 +339,15 @@ class ShowCatalog:
         # add sign-off and off-air videos to the clip index
         if "sign_off_video" in self.config:
             self._l.debug("Adding sign-off video")
-            video_clip = VideoFileClip(self.config["sign_off_video"])
-            self.clip_index["sign_off"] = [CatalogEntry(self.config["sign_off_video"], video_clip.duration, "sign_off", content_type="sign_off")]
-            video_clip.close()
+            duration = self._get_required_video_duration(self.config["sign_off_video"])
+            self.clip_index["sign_off"] = [CatalogEntry(self.config["sign_off_video"], duration, "sign_off", content_type="sign_off")]
             self._l.debug(f"Added sign-off video {self.config['sign_off_video']}")
             total_count += 1
 
         if "off_air_video" in self.config:
             self._l.debug("Adding off air video")
-            video_clip = VideoFileClip(self.config["off_air_video"])
-            self.clip_index["off_air"] = [CatalogEntry(self.config["off_air_video"], video_clip.duration, "off_air", content_type="off_air")]
-            video_clip.close()
+            duration = self._get_required_video_duration(self.config["off_air_video"])
+            self.clip_index["off_air"] = [CatalogEntry(self.config["off_air_video"], duration, "off_air", content_type="off_air")]
             self._l.debug(f"Added off air video {self.config['off_air_video']}")
             total_count += 1
 
@@ -335,6 +362,9 @@ class ShowCatalog:
         self._l.info(f"Catalog build complete. Added {total_count} clips to catalog.")
         self._build_tags()
         self._write_catalog()
+
+        # sequences only include catalogued files, so scan them once the catalog is written
+        SequenceAPI.scan_sequences(self.config)
 
     def _scan_directory(self, tag, is_bumps=False, content_type="feature"):
         count_added = 0
@@ -430,8 +460,11 @@ class ShowCatalog:
             candidate = all_offair[0]
         return candidate
 
+    def __bump_path(self, fp):
+        return fp if os.path.isabs(fp) else f"{self.config['content_dir']}/{fp}"
+
     def __bump_collector(self, tag, fp):
-        bump_path = f"{self.config['content_dir']}/{fp}"
+        bump_path = self.__bump_path(fp)
 
         to_process = [bump_path]
         # check if this is a dir
@@ -445,7 +478,7 @@ class ShowCatalog:
                 self.clip_index[tag].append(fp)
         else:
             self._l.error(f"{tag} specified but not found: {fp}")
-            self._l.error(f"File paths for {tag} should be relative to the content_dir")
+            self._l.error(f"File paths for {tag} should be relative to the content_dir, or absolute")
 
     def get_start_bump(self, fp):
         return self.__bump_finder("start_bumps", fp)
@@ -465,11 +498,11 @@ class ShowCatalog:
 
         if not len(candidates):
             clean_match = fp.removesuffix("/")
+            bump_dir = Path(self.__bump_path(clean_match))
             for bump in self.clip_index[bump_tag]:
-                path_obj = Path(bump.path)
-                parent_path = path_obj.parent.name
+                parent = Path(bump.path).parent
 
-                if parent_path == clean_match:
+                if parent.name == clean_match or parent == bump_dir:
                     candidates.append(bump)
 
         if len(candidates):
@@ -661,7 +694,7 @@ class ShowCatalog:
                 end_candidate = autos.get("next_bump", None)
 
                 if strategy == "start":
-                    end_candidate = self.find_bump(target_duration, when, ShowCatalog.prebump, bump_tag=bump_dir,
+                    end_candidate = self.find_bump(target_duration, when, ShowCatalog.postbump, bump_tag=bump_dir,
                                                    lookahead=lookahead)
                 elif strategy == "end":
                     start_candidate = self.find_bump(target_duration, when, ShowCatalog.prebump, bump_tag=bump_dir,
@@ -684,41 +717,58 @@ class ShowCatalog:
 
 
     def make_reel_fill(self, when, length, use_bumpers=True, commercial_dir=None, bump_dir=None, strict_count=None,
-                       lookahead=None):
+                       lookahead=None, break_strategy=None):
         target_break_duration = self.config["break_duration"]
 
         strategy = self.config.get("break_strategy", None)
+
+        break_info = SlotReader.get_break_info(self.config, when)
+        strategy = break_info["break_strategy"] if break_info["break_strategy"] else strategy
+        strategy = break_strategy if break_strategy else strategy
+        blocks = []
+        remaining = length
         if strategy == "end":
             target_break_duration = length
-        elif strict_count:
-            target_break_duration = length / strict_count
-
-        remaining = length
-        blocks = []
-        keep_going = True
-        while remaining and keep_going:
-            block = None
             try:
                 block = self.make_reel_block(
                     when, use_bumpers, target_break_duration, commercial_dir=commercial_dir, bump_dir=bump_dir,
                     lookahead=lookahead
                 )
+                remaining -= block.duration
+                blocks.append(block)
             except MatchingContentNotFound:
                 self._l.debug(
                     f"Could not find matching content for {remaining} seconds - will attempt to fill with BRB"
                 )
+        else:
+            if strict_count:
+                target_break_duration = length / strict_count
 
-            if block and (remaining - block.duration) > 0:
-                remaining -= block.duration
-                blocks.append(block)
 
-                if strict_count and len(blocks) >= strict_count:
+
+            keep_going = True
+            while remaining and keep_going:
+                block = None
+                try:
+                    block = self.make_reel_block(
+                        when, use_bumpers, target_break_duration, commercial_dir=commercial_dir, bump_dir=bump_dir,
+                        lookahead=lookahead
+                    )
+                except MatchingContentNotFound:
+                    self._l.debug(
+                        f"Could not find matching content for {remaining} seconds - will attempt to fill with BRB"
+                    )
+
+                if block and (remaining - block.duration) > 0:
+                    remaining -= block.duration
+                    blocks.append(block)
+
+                    if strict_count and len(blocks) >= strict_count:
+                        keep_going = False
+
+                else:
                     keep_going = False
 
-            else:
-                keep_going = False
-
-        keep_going = True
 
         # discard that block and fill using the tightest technique possible
         additional_reels = []
@@ -727,6 +777,7 @@ class ShowCatalog:
             fill = AutoBumpAgent.fill_block(self.config, remaining)
             blocks.append(ReelBlock(fill, [], None))
         else:
+            keep_going = True
             while remaining and keep_going:
                 candidate = None
                 try:

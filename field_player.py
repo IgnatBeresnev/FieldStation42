@@ -9,7 +9,7 @@ import signal
 import logging
 
 from fs42.liquid_manager import LiquidManager
-from fs42.station_manager import StationManager
+from fs42.station_manager import StationManager, StationConfigError
 from fs42.timings import MIN_1, DAYS
 from fs42.station_player import (
     StationPlayer,
@@ -24,6 +24,7 @@ from fs42.reception import (
     none_change_effect,
 )
 from fs42.live_schedule_agent import LiveScheduleAgent
+from fs42.command_executor import execute_command
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s", level=logging.INFO
@@ -77,6 +78,11 @@ def input_check():
                 case "mpv_command":
                     action = q_message.get("action", "")
                     return PlayerOutcome(PlayerState.SUCCESS, f"mpv_command:{action}")
+                case "parental_digit":
+                    digit = str(q_message.get("digit", ""))
+                    return PlayerOutcome(PlayerState.SUCCESS, f"parental_digit:{digit}")
+                case "parental_clear":
+                    return PlayerOutcome(PlayerState.SUCCESS, "parental_clear")
 
 
     channel_socket = StationManager().server_conf["channel_socket"]
@@ -188,6 +194,10 @@ def main_loop(transition_fn, shutdown_queue=None, api_proc=None, schedule_lock=N
         elif channel_conf["network_type"] == "web" and not skip_play:
             logger.info("Starting the web channel")
             player_state = player.show_web(channel_conf)
+        elif channel_conf["network_type"] == "executable" and not skip_play:
+            logger.info("Starting an executable channel")
+            player.stop_player()
+            player_state =  execute_command(channel_conf, input_check)
         elif not skip_play:
             now = datetime.datetime.now()
 
@@ -210,6 +220,9 @@ def main_loop(transition_fn, shutdown_queue=None, api_proc=None, schedule_lock=N
 
         if player_state.status == PlayerState.CHANNEL_CHANGE:
             stuck_timer = 0
+            player.parental_unlocked_network = None
+            # Close any lingering pop-up overlay
+            player._close_now_playing()
             # Cache stations to prevent race conditions during reload
             station_cache = manager.stations
             stations_len = len(station_cache)
@@ -278,6 +291,12 @@ def main_loop(transition_fn, shutdown_queue=None, api_proc=None, schedule_lock=N
 
             # long_change_effect(player, reception)
             transition_fn(player, reception)
+
+        elif player_state.status == PlayerState.PARENTAL_CONTROLS:
+            stuck_timer = 0
+            player_state = player.prompt_parental_controls(channel_conf)
+            if player_state.status != PlayerState.SUCCESS:
+                skip_play = True
 
         elif player_state.status == PlayerState.PLAY_FILE:
             print("Got playfile!", player_state.payload )
@@ -391,6 +410,9 @@ if __name__ == "__main__":
 
     try:
         main_loop(trans_fn, shutdown_queue=shutdown_queue, api_proc=api_proc, schedule_lock=schedule_lock)
+    except StationConfigError as e:
+        logging.getLogger("FieldPlayer").error(str(e))
+        raise SystemExit(-1)
     finally:
         if shutdown_queue is not None:
             shutdown_queue.put("shutdown")

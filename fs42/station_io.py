@@ -34,8 +34,8 @@ class StationIO:
     FILE_CHECKS = ["content_dir", "sign_off_video", "off_air_video", "standby_image", "be_right_back_media"]
 
     # Network types that don't have catalogs or schedules
-    NO_CATALOG = {"guide", "streaming", "web"}
-    NO_SCHEDULE = {"guide", "streaming", "web"}
+    NO_CATALOG = {"guide", "streaming", "web", "executable"}
+    NO_SCHEDULE = {"guide", "streaming", "web", "executable"}
 
     def __init__(self):
         self._l = logging.getLogger("STATIONIO")
@@ -94,16 +94,7 @@ class StationIO:
         return station_configs
 
     def read_raw_station_config(self, network_name):
-        """
-        Read a station configuration file without any processing or normalization.
-        Returns the raw JSON data exactly as it appears on disk.
 
-        Args:
-            network_name: The network name to look up
-
-        Returns:
-            tuple: (success: bool, data: dict or None, error_message: str or None)
-        """
         file_path = self.find_config_by_network_name(network_name)
 
         if file_path is None:
@@ -119,13 +110,7 @@ class StationIO:
             return False, None, f"Failed to read configuration: {str(e)}"
 
     def list_raw_station_configs(self):
-        """
-        List all station configurations without processing or normalization.
-        Returns raw JSON data exactly as it appears on disk.
 
-        Returns:
-            list: List of raw station configuration dictionaries
-        """
         cfiles = glob.glob(f"{self.confs_dir}*.json")
         raw_configs = []
 
@@ -280,6 +265,15 @@ class StationIO:
                 else:
                     raise Exception(f"No meta_hints tag specified in {filename}")
 
+
+                allowed = set(schedule_hint.META_HINT_KEYS) | {"tags", "exclusive"}
+                unknown = set(hint.keys()) - allowed
+                if unknown:
+                    raise Exception(
+                        f"Unknown meta_hints field(s) {sorted(unknown)} in {filename} - "
+                        f"expected one of: {', '.join(sorted(allowed))}"
+                    )
+
         # Add metadata flags
         station_conf["_has_catalog"] = station_conf["network_type"] not in StationIO.NO_CATALOG
         station_conf["_has_schedule"] = station_conf["network_type"] not in StationIO.NO_SCHEDULE
@@ -320,7 +314,11 @@ class StationIO:
 
             # Convert minutes to seconds and apply fill ratio
             target_seconds = (requested_duration * timings.MIN_1) * fill_target
-            clip_dict[clip_tag] = {"tags": clip_tag, "duration": target_seconds}
+            clip_dict[clip_tag] = {
+                "tags": clip_tag,
+                "duration": target_seconds,
+                "total_duration": requested_duration * timings.MIN_1,
+            }
             if start_clip:
                 clip_dict[clip_tag]["start_clip"] = start_clip
                 clip_dict[clip_tag]["end_clip"] = end_clip
@@ -328,9 +326,9 @@ class StationIO:
         return clip_dict
 
     def load_and_process_all_stations(self):
-
         raw_configs = self.load_all_station_configs()
         processed_stations = []
+        skipped = []
 
         for config_data in raw_configs:
             fname = config_data['filename']
@@ -341,13 +339,18 @@ class StationIO:
                 if processed_conf:
                     processed_stations.append(processed_conf)
             except Exception as e:
+                network_name = config.get("station_conf", {}).get("network_name")
                 self._l.error("*" * 60)
-                self._l.error(f"Error loading station configuration: {fname}")
-                self._l.exception(e)
+                self._l.error(f"Skipping station configuration: {fname}")
+                self._l.error(f"Station will not be live until this is fixed: {e}")
                 self._l.error("*" * 60)
-                raise
+                skipped.append({
+                    "filename": fname,
+                    "network_name": network_name,
+                    "error": str(e),
+                })
 
-        return processed_stations
+        return processed_stations, skipped
 
     def validate_station_config(self, config_data):
 
@@ -401,7 +404,7 @@ class StationIO:
             return False, errors
         return True, []
 
-    def save_station_config(self, network_name, config_data, existing_stations, is_update=False):
+    def save_station_config(self, network_name, config_data, is_update=False):
 
         # Validate the configuration
         is_valid, errors = self.validate_station_config(config_data)
@@ -417,7 +420,6 @@ class StationIO:
         is_unique, uniqueness_error = self._check_uniqueness(
             station_conf["channel_number"],
             station_conf["network_name"],
-            existing_stations,
             exclude_name=exclude_name
         )
         if not is_unique:
@@ -451,28 +453,14 @@ class StationIO:
 
         return True, "Station configuration saved successfully", file_path
 
-    def remove_station_config(self, network_name, existing_stations):
+    def remove_station_config(self, network_name):
 
-        # Check if station exists
-        station_exists = any(s["network_name"] == network_name for s in existing_stations)
-        if not station_exists:
+        file_path = self.find_config_by_network_name(network_name)
+
+        if file_path is None:
             msg = f"Station '{network_name}' not found"
             self._l.warning(msg)
             return False, msg
-
-        # Get file path
-        file_path = self.get_config_file_path(network_name)
-
-        if not os.path.exists(file_path):
-            # Station exists in memory but file not found - try to find it
-            # This could happen if the file was manually renamed
-            self._l.warning(f"Expected file not found: {file_path}")
-            file_path = self.find_config_by_network_name(network_name)
-
-            if file_path is None:
-                msg = f"Configuration file for '{network_name}' not found"
-                self._l.error(msg)
-                return False, msg
 
         # Delete the file
         success, message = self.delete_station_file(file_path)
@@ -482,22 +470,24 @@ class StationIO:
 
         return True, f"Station '{network_name}' deleted successfully"
 
-    def _check_uniqueness(self, channel_number, network_name, existing_stations, exclude_name=None):
+    def _check_uniqueness(self, channel_number, network_name, exclude_name=None):
+
+        existing_stations = [raw.get("station_conf", {}) for raw in self.list_raw_station_configs()]
 
         # Check channel number uniqueness
         for station in existing_stations:
-            if exclude_name and station["network_name"] == exclude_name:
+            if exclude_name and station.get("network_name") == exclude_name:
                 continue
-            if station["channel_number"] == channel_number:
-                msg = f"Channel number {channel_number} is already used by station '{station['network_name']}'"
+            if station.get("channel_number") == channel_number:
+                msg = f"Channel number {channel_number} is already used by station '{station.get('network_name')}'"
                 self._l.warning(msg)
                 return False, msg
 
         # Check network name uniqueness
         for station in existing_stations:
-            if exclude_name and station["network_name"] == exclude_name:
+            if exclude_name and station.get("network_name") == exclude_name:
                 continue
-            if station["network_name"] == network_name:
+            if station.get("network_name") == network_name:
                 msg = f"Network name '{network_name}' already exists"
                 self._l.warning(msg)
                 return False, msg

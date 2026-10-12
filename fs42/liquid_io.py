@@ -2,8 +2,10 @@ import sqlite3
 import json
 from contextlib import contextmanager
 from datetime import datetime
+from fs42.catalog_entry import CatalogEntry
+from fs42.autobump_agent import AutoBumpAgent
 from fs42.station_manager import StationManager
-from fs42.liquid_blocks import LiquidBlock, LiquidLoopBlock, LiquidClipBlock, LiquidOffAirBlock
+from fs42.liquid_blocks import LiquidBlock, LiquidLoopBlock, LiquidClipBlock, LiquidOffAirBlock, LiquidWebBlock
 from fs42.block_plan import BlockPlanEntry
 from fs42.catalog_api import CatalogAPI
 from fs42.title_parser import TitleParser
@@ -56,6 +58,9 @@ class LiquidIO:
                             ON liquid_blocks(station)""")
             cursor.execute("""CREATE INDEX IF NOT EXISTS idx_liquid_blocks_station_time
                             ON liquid_blocks(station, start_time, end_time)""")
+            # Supports window queries that span every station (see query_all_liquid_blocks)
+            cursor.execute("""CREATE INDEX IF NOT EXISTS idx_liquid_blocks_time
+                            ON liquid_blocks(start_time, end_time)""")
 
             cursor.close()
             connection.commit()
@@ -121,6 +126,36 @@ class LiquidIO:
                 liquid_blocks.append(block)
 
             return liquid_blocks
+
+    def query_all_liquid_blocks(self, start: str, end: str) -> dict[str, list[LiquidBlock]]:
+
+        with self._get_connection() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT * FROM liquid_blocks WHERE start_time < ? AND end_time > ? ORDER BY station, start_time",
+                (end, start),
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+
+            # Collect content IDs across every station for one batch lookup
+            content_ids = set()
+            for row in rows:
+                content_json = json.loads(row[9]) if row[9] else None
+                if content_json:
+                    if isinstance(content_json, list):
+                        content_ids.update(content_json)
+                    else:
+                        content_ids.add(content_json)
+
+            content_cache = CatalogAPI.get_entries_by_ids(list(content_ids)) if content_ids else {}
+
+            by_station = {}
+            for row in rows:
+                block = LiquidIO._build_block_from_row(row, content_cache)
+                by_station.setdefault(row[1], []).append(block)
+
+            return by_station
 
     def put_liquid_blocks(self, station_name: str, liquid_blocks: list[LiquidBlock]):
         """
@@ -209,7 +244,10 @@ class LiquidIO:
                         if cached_entry:
                             content_obj.append(cached_entry)
                     else:
-                        content_obj.append(CatalogAPI.get_entry_by_id(int(entry)))  
+                        content_obj.append(CatalogAPI.get_entry_by_id(int(entry)))
+        elif _liquid_type == "LiquidWebBlock":
+            jobj = next((j for j in _plan_json if AutoBumpAgent.is_autobump_url(j["path"])), _plan_json[0])
+            content_obj = CatalogEntry(jobj["path"], jobj["duration"], AutoBumpAgent.tag_str)
 
         main_normal = StationManager().server_conf.get("normalize_titles", True)
         the_title = _title
@@ -247,6 +285,8 @@ class LiquidIO:
                 return LiquidClipBlock(*args)
             case "LiquidLoopBlock":
                 return LiquidLoopBlock(*args)
+            case "LiquidWebBlock":
+                return LiquidWebBlock(*args)
             case _:
                 raise ValueError(f"Unknown liquid type: {liquid_type}")
 

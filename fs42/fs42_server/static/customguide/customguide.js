@@ -4,10 +4,12 @@ const SLOT_COUNT = parseInt(params.get('slots')) || 3;
 const HEADER_TEXT = params.get('header') || null;
 const PAUSE_OVERRIDE = params.get('pause');
 const MOCK = params.get('mock') === '1';
+const USE_META = params.get('use_meta') !== '0';
+const SHOW_DESCRIPTION = ['1', 'true'].includes((params.get('show_description') || '').toLowerCase());
 const MUSIC_PATH = params.get('music');
 const VIDEOS = params.get('videos') !== 'false';
 const MESSAGES_PATH = params.get('messages');
-const LOOP = params.get('loop') === '1';
+const LOOP = params.get('loop') !== '0';
 let RANDOM_START = params.get('random_start') === '1';
 
 let stations = [];
@@ -51,7 +53,7 @@ function loadTheme(name) {
         resolve();
       }
     });
-    document.head.insertBefore(link, document.head.firstChild);
+    document.head.appendChild(link);
   });
 }
 
@@ -81,7 +83,7 @@ function getPauseDuration() {
 
 function getScrollSpeed() {
   const val = parseFloat(getCSSVar('--scroll-speed'));
-  return (!isNaN(val) && val > 0) ? val : 0.8;
+  return (!isNaN(val) && val > 0) ? val : 1.1;
 }
 
 function computeSlotTimes() {
@@ -112,8 +114,7 @@ function mockFetchStations() {
       channel_number: num,
       network_name: 'ch' + num,
       network_long_name: 'Channel ' + num,
-      has_schedule: true,
-      schedule_summary: { start: 1, end: 1 }
+      has_schedule: true
     };
   });
 }
@@ -137,40 +138,26 @@ function mockFetchAllSchedules(slots) {
 }
 
 async function fetchStations() {
-  const all = await window.fs42Common.fetchStationSummary();
+  const all = await window.fs42Common.fetchChannels();
   stations = all.filter(s => !s.hidden);
-  stations.forEach(s => {
-    s.has_schedule = s.schedule_summary &&
-      s.schedule_summary.start !== 0 &&
-      s.schedule_summary.end !== 0;
-  });
 }
 
-async function fetchAllSchedules(slots) {
+async function fetchAllSchedules(slots, includeMeta) {
   if (!stations.length) return {};
 
-  const overallStart = new Date(slots[0].start.getTime() - 3 * 60 * 60 * 1000);
+  const overallStart = slots[0].start;
   const overallEnd = slots[slots.length - 1].end;
-  const schedules = {};
 
-  for (const station of stations) {
-    if (!station.has_schedule) {
-      schedules[station.network_name] = [];
-      continue;
-    }
-    try {
-      const blocks = await window.fs42Common.fetchSchedule(
-        station.network_name,
-        formatDateForAPI(overallStart),
-        formatDateForAPI(overallEnd)
-      );
-      schedules[station.network_name] = blocks || [];
-    } catch (e) {
-      console.error('error fetching schedule for', station.network_name, e);
-      schedules[station.network_name] = [];
-    }
+  try {
+    return await window.fs42Common.fetchGuideSchedules(
+      formatDateForAPI(overallStart),
+      formatDateForAPI(overallEnd),
+      includeMeta
+    );
+  } catch (e) {
+    console.error('error fetching schedules', e);
+    return {};
   }
-  return schedules;
 }
 
 
@@ -266,16 +253,9 @@ function startScrolling() {
   const pxPerMs = getScrollSpeed() / 50;
   const pauseMs = getPauseDuration();
 
-  // Clean up any previous clone
-  const existingClone = document.getElementById('guide-scroll-strip-clone');
-  if (existingClone) existingClone.remove();
-
-  let originalHeight, clone;
-  
-
-    
+  scrollY = 0;
   strip.style.transform = 'translateY(0)';
-  pauseUntil = LOOP ? 0 : performance.now() + pauseMs;
+  pauseUntil = performance.now() + pauseMs;
 
   let lastTime = null;
 
@@ -285,43 +265,25 @@ function startScrolling() {
       return;
     }
 
-    // Loop guide if true
-    if (LOOP) {
-      if (lastTime !== null) scrollY += pxPerMs * (now - lastTime);
-      lastTime = now;
+    const maxScroll = strip.offsetHeight - listings.clientHeight;
 
-      if (scrollY >= originalHeight) {
-        scrollY -= originalHeight;
-        stopScrolling();
-        buildGuide().then(startScrolling);
-        return;
-      }
-
-      strip.style.transform = `translateY(-${scrollY}px)`;
-      clone.style.transform = `translateY(${originalHeight - scrollY}px)`;
-      animFrame = requestAnimationFrame(tick);
-
-    } else {
-      const maxScroll = strip.offsetHeight - listings.clientHeight;
-
-      if (maxScroll <= 0) {
-        setTimeout(async function () { await buildGuide(); startScrolling(); }, pauseMs);
-        return;
-      }
-
-      if (lastTime !== null) scrollY += pxPerMs * (now - lastTime);
-      lastTime = now;
-
-      if (scrollY >= maxScroll) {
-        strip.style.transform = `translateY(-${maxScroll}px)`;
-        lastTime = null;
-        setTimeout(async function () { await buildGuide(); startScrolling(); }, pauseMs);
-        return;
-      }
-
-      strip.style.transform = `translateY(-${scrollY}px)`;
-      animFrame = requestAnimationFrame(tick);
+    if (maxScroll <= 0) {
+      setTimeout(async function () { await buildGuide(); startScrolling(); }, pauseMs);
+      return;
     }
+
+    if (lastTime !== null) scrollY += pxPerMs * (now - lastTime);
+    lastTime = now;
+
+    if (scrollY >= maxScroll) {
+      strip.style.transform = `translateY(-${maxScroll}px)`;
+      lastTime = null;
+      setTimeout(async function () { await buildGuide(); startScrolling(); }, pauseMs);
+      return;
+    }
+
+    strip.style.transform = `translateY(-${scrollY}px)`;
+    animFrame = requestAnimationFrame(tick);
   }
 
   animFrame = requestAnimationFrame(tick);
@@ -401,6 +363,20 @@ function createGridProgramBlock(block, guideStartMs, guideEndMs, totalMs, now) {
   titleSpan.textContent = block.title || 'Untitled';
   el.appendChild(titleSpan);
 
+  const meta = USE_META && block.meta;
+  let desc = meta && meta.plot;
+  let isEpisodeTitle = false;
+  if (meta && meta.type === 'episode' && !SHOW_DESCRIPTION && meta.title) {
+    desc = meta.title;
+    isEpisodeTitle = true;
+  }
+  if (desc) {
+    const descSpan = document.createElement('span');
+    descSpan.className = isEpisodeTitle ? 'program-desc is-episode-title' : 'program-desc';
+    descSpan.textContent = desc;
+    el.appendChild(descSpan);
+  }
+
   return el;
 }
 
@@ -465,7 +441,7 @@ function buildGridStrip(slots, schedules) {
 async function buildGrid() {
   const slots = computeSlotTimes();
   updateGridHeader(slots);
-  const schedules = MOCK ? mockFetchAllSchedules(slots) : await fetchAllSchedules(slots);
+  const schedules = MOCK ? mockFetchAllSchedules(slots) : await fetchAllSchedules(slots, USE_META);
   const gridListings = document.getElementById('grid-listings');
   gridListings.innerHTML = '';
   gridListings.appendChild(buildGridStrip(slots, schedules));
@@ -488,15 +464,15 @@ function startGridScrolling() {
   const existingClone = document.getElementById('grid-scroll-strip-clone');
   if (existingClone) existingClone.remove();
 
-  let originalHeight, clone;
-  
+  let clone;
+  const originalHeight = strip.scrollHeight;
+
   // Loop guide if true.
   if (LOOP) {
     clone = strip.cloneNode(true);
     clone.id = 'grid-scroll-strip-clone';
     clone.setAttribute('aria-hidden', 'true');
     strip.parentElement.appendChild(clone);
-    originalHeight = strip.scrollHeight;
     clone.style.transform = `translateY(${originalHeight}px)`;
   }
       // Random channel start
@@ -569,17 +545,22 @@ async function initGridMode() {
   if (oldClock) oldClock.remove();
   buildGridDOM();
   startClock();
-  if (MOCK) mockFetchStations(); else await fetchStations();
-  await Promise.all([
+
+
+  const mediaLoaded = Promise.all([
     loadMusicPlaylist(),
     loadVideoPlaylist(),
     loadMessages()
   ]);
+
+  if (MOCK) mockFetchStations(); else await fetchStations();
+  await buildGrid();
+  startGridScrolling();
+
+  await mediaLoaded;
   setupMusic();
   setupVideo();
   startTextCarousel();
-  await buildGrid();
-  startGridScrolling();
 }
 
 
@@ -775,10 +756,11 @@ async function init() {
     await initGridMode();
   } else {
     startClock();
+    const musicLoaded = loadMusicPlaylist();
     if (MOCK) mockFetchStations(); else await fetchStations();
-    await loadMusicPlaylist();
     await buildGuide();
     startScrolling();
+    await musicLoaded;
     setupMusic();
   }
 }

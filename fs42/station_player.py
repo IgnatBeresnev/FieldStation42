@@ -44,13 +44,24 @@ logging.basicConfig(format="%(asctime)s %(levelname)s:%(name)s:%(message)s", lev
 
 
 def update_status_socket(
-    status, network_name, channel, title=None, timestamp="%Y-%m-%dT%H:%M:%S", duration=None, file_path=None, content_type=None
+    status,
+    network_name,
+    channel,
+    title=None,
+    timestamp="%Y-%m-%dT%H:%M:%S",
+    duration=None,
+    file_path=None,
+    content_type=None,
+    awaiting_pin=False,
+    pin_digits_entered=0,
 ):
     status_obj = {
         "status": status,
         "network_name": network_name,
         "channel_number": channel,
         "timestamp": datetime.datetime.now().strftime(timestamp),
+        "awaiting_pin": awaiting_pin,
+        "pin_digits_entered": pin_digits_entered,
     }
     if title is not None:
         status_obj["title"] = title
@@ -73,6 +84,7 @@ class PlayerState(Enum):
     CHANNEL_CHANGE = 4
     EXIT_COMMAND = 5
     PLAY_FILE = 6
+    PARENTAL_CONTROLS = 7
 
 
 class PlayerOutcome:
@@ -169,18 +181,19 @@ class StationPlayer:
 
         if not mpv:
             self._l.info("Starting MPV instance")
-            # command on client: mpv --input-ipc-server=/tmp/mpvsocket --idle --force-window 
+            # command on client: mpv --input-ipc-server=runtime/mpv.socket --idle --force-window
 
             # if not running on trixie
             self.mpv = MPV(
                 start_mpv=start_it,
-                ipc_socket="/tmp/mpvsocket",
+                ipc_socket="runtime/mpv.socket",
                 input_default_bindings=False,
                 fs=True,
                 idle=True,
                 force_window=True,
                 script_opts="osc-idlescreen=no",
                 hr_seek="yes",
+                image_display_duration="inf",
             )
 
         self.station_config = station_config
@@ -192,6 +205,9 @@ class StationPlayer:
         self.skip_reception_check = False
         self.web_process = None
         self.web_queue = None
+        self.parental_controls_process = None
+        self.parental_controls_queue = None
+        self.parental_unlocked_network = None
         self.scrambler = None
         self.now_playing_process = None
         self.schedule_lock = None
@@ -236,6 +252,177 @@ class StationPlayer:
 
         return False
 
+    @staticmethod
+    def is_non_interrupting(response):
+        return response.status == PlayerState.SUCCESS
+
+    def _start_parental_controls_overlay(self, network_name):
+        self._close_parental_controls_overlay()
+
+        try:
+            from fs42.overlay.parental_controls import run_parental_controls
+
+            self.parental_controls_queue = multiprocessing.Queue()
+            self.parental_controls_process = run_parental_controls(
+                network_name,
+                self.parental_controls_queue,
+                self._parental_controls_theme(),
+            )
+            self._update_parental_controls_overlay()
+        except Exception as e:
+            self._l.warning(f"Could not start parental controls overlay: {e}")
+            self.parental_controls_process = None
+            self.parental_controls_queue = None
+
+    def _update_parental_controls_overlay(self, digits=0, error=False):
+        if self.parental_controls_queue:
+            self.parental_controls_queue.put({
+                "digits": digits,
+                "error": error
+            })
+
+    def _close_parental_controls_overlay(self):
+        if self.parental_controls_queue:
+            try:
+                self.parental_controls_queue.put({"close": True})
+            except Exception:
+                pass
+
+        if self.parental_controls_process and self.parental_controls_process.is_alive():
+            try:
+                self.parental_controls_process.join(timeout=0.2)
+                if self.parental_controls_process.is_alive():
+                    self.parental_controls_process.terminate()
+                    self.parental_controls_process.join(timeout=0.2)
+                if self.parental_controls_process.is_alive():
+                    self.parental_controls_process.kill()
+                    self.parental_controls_process.join(timeout=0.1)
+            except Exception as e:
+                self._l.warning(f"Error terminating parental controls overlay: {e}")
+
+        self.parental_controls_process = None
+        self.parental_controls_queue = None
+
+    def _parental_controls_pin(self):
+        pin = str(StationManager().server_conf.get("parental_controls_pin", ""))
+        if len(pin) == 4 and pin.isdigit():
+            return pin
+
+        if pin:
+            self._l.warning("parental_controls_pin must be exactly 4 digits")
+        return None
+
+    def _parental_controls_theme(self):
+        theme = StationManager().server_conf.get("parental_controls_theme", "minimal")
+        if theme in ("classic", "modern", "minimal"):
+            return theme
+
+        self._l.warning(f"Unknown parental_controls_theme: {theme}")
+        return "minimal"
+
+    def _parental_controls_required(self, network_name):
+        if not self._parental_controls_pin():
+            return False
+
+        station_config = StationManager().station_by_name(network_name)
+        if not station_config:
+            return False
+
+        station_conf = station_config.get("station_conf", {})
+        return bool(
+            station_config.get("parental_controls")
+            or station_conf.get("parental_controls")
+        )
+
+    def prompt_parental_controls(self, station_config):
+        network_name = station_config["network_name"]
+        channel_number = station_config["channel_number"]
+        pin = self._parental_controls_pin()
+
+        if not pin:
+            return PlayerOutcome(PlayerState.SUCCESS)
+
+        entered = ""
+        self.stop_player()
+        self._start_parental_controls_overlay(network_name)
+        update_status_socket(
+            "playing",
+            network_name,
+            channel_number,
+            title="Parental Controls",
+            awaiting_pin=True,
+            pin_digits_entered=0,
+        )
+
+        try:
+            while True:
+                response = self.input_check_fn()
+                if not response:
+                    time.sleep(0.05)
+                    continue
+
+                if self.handle_runtime_command_outcome(response):
+                    continue
+
+                if response.status != PlayerState.SUCCESS:
+                    return response
+
+                if not isinstance(response.payload, str):
+                    continue
+
+                if response.payload.startswith("parental_digit:"):
+                    digit = response.payload.split(":", 1)[1]
+                    if not digit.isdigit() or len(digit) != 1:
+                        continue
+
+                    entered += digit
+                    self._update_parental_controls_overlay(len(entered), False)
+                    update_status_socket(
+                        "playing",
+                        network_name,
+                        channel_number,
+                        title="Parental Controls",
+                        awaiting_pin=True,
+                        pin_digits_entered=len(entered),
+                    )
+
+                    if len(entered) >= len(pin):
+                        if entered == pin:
+                            self.parental_unlocked_network = network_name
+                            return PlayerOutcome(PlayerState.SUCCESS)
+
+                        entered = ""
+                        self._update_parental_controls_overlay(0, True)
+                        update_status_socket(
+                            "playing",
+                            network_name,
+                            channel_number,
+                            title="Parental Controls",
+                            awaiting_pin=True,
+                            pin_digits_entered=0,
+                        )
+
+                elif response.payload == "parental_clear":
+                    entered = ""
+                    self._update_parental_controls_overlay(0, False)
+                    update_status_socket(
+                        "playing",
+                        network_name,
+                        channel_number,
+                        title="Parental Controls",
+                        awaiting_pin=True,
+                        pin_digits_entered=0,
+                    )
+        finally:
+            self._close_parental_controls_overlay()
+            update_status_socket(
+                "idle",
+                network_name,
+                channel_number,
+                awaiting_pin=False,
+                pin_digits_entered=0,
+            )
+
     def _close_now_playing(self):
         # terminate the Now Playing overlay if it's running
         if self.now_playing_process and self.now_playing_process.is_alive():
@@ -253,6 +440,15 @@ class StationPlayer:
                 self._l.warning(f"Error terminating overlay: {e}")
 
             self.now_playing_process = None
+
+    def _nfo_overlay_data(self, file_path):
+
+        from fs42.metadata_io import MetadataIO
+        from fs42.nfo_agent import NFOAgent, NFOData
+
+        meta = MetadataIO.read(file_path)
+        lines = NFOAgent.overlay_lines(meta)
+        return NFOData(lines) if lines else None
 
     def _show_now_playing(self, file_path):
         # show the Now Playing overlay for an audio file
@@ -309,6 +505,8 @@ class StationPlayer:
         self.web_process = None
         self.web_queue = None
 
+        self._close_parental_controls_overlay()
+
         # Terminate any running now playing overlay
         self._l.info("Terminating now playing overlay")
         self._close_now_playing()
@@ -327,7 +525,7 @@ class StationPlayer:
             else:
                 self.mpv.vf = self.reception.filter()
 
-    def play_file(self, file_path, file_duration=None, current_time=None, is_stream=False, title="Unknown", content_type=None, media_type=None):
+    def play_file(self, file_path, file_duration=None, offset_seconds=None, is_stream=False, title="Unknown", content_type=None, media_type=None):
         try:
             if os.path.exists(file_path) or is_stream or AutoBumpAgent.is_autobump_url(file_path):
                 self._l.debug(f"%%%Attempting to play {file_path}")
@@ -340,7 +538,7 @@ class StationPlayer:
                     else:
                         ts_format = "%Y-%m-%dT%H:%M:%S"
                     duration = (
-                        f"{str(datetime.timedelta(seconds=int(current_time)))}/{str(datetime.timedelta(seconds=int(file_duration)))}"
+                        f"{str(datetime.timedelta(seconds=int(offset_seconds)))}/{str(datetime.timedelta(seconds=int(file_duration)))}"
                         if file_duration
                         else "n/a"
                     )
@@ -365,7 +563,7 @@ class StationPlayer:
                 if AutoBumpAgent.is_autobump_url(file_path):
                     from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
                     web_url = AutoBumpAgent.extract_url(file_path)
-                    remaining = file_duration - (current_time or 0) if file_duration else None
+                    remaining = file_duration - (offset_seconds or 0) if file_duration else None
                     if remaining is not None:
                         parsed = urlparse(web_url)
                         params = parse_qs(parsed.query, keep_blank_values=True)
@@ -409,7 +607,11 @@ class StationPlayer:
                             return False
                         if is_stream:
                             response = self.input_check_fn()
-                            if response and not self.handle_runtime_command_outcome(response):
+                            if (
+                                response
+                                and not self.handle_runtime_command_outcome(response)
+                                and not self.is_non_interrupting(response)
+                            ):
                                 self._pending_response = response
                                 return False
                         time.sleep(0.05)
@@ -420,12 +622,8 @@ class StationPlayer:
                         time.sleep(0.05)
 
                 # Perform seek if needed (before showing overlay)
-                if not is_stream and current_time is not None and current_time > 0:
-                    try:
-                        self.mpv.command("seek", current_time, "absolute")
-                        self._l.info(f"Seeking to: {current_time}")
-                    except Exception as e:
-                        self._l.error(f"Failed seeking {current_time} on {file_path}: {e}")
+                if not is_stream and offset_seconds is not None and offset_seconds > 0:
+                    self._seek_with_verify(file_path, offset_seconds, timeout_seconds)
 
                 # Show Now Playing overlay for audio feature files
                 self._l.info(f"Media type: {media_type}, Content type: {content_type}")
@@ -436,12 +634,12 @@ class StationPlayer:
                     # then spawn a new one only if this video has an NFO sidecar.
                     self._close_now_playing()
                     try:
-                        from fs42.nfo_agent import NFOAgent
-                        nfo_data = NFOAgent.read_nfo(file_path)
+                        nfo_data = self._nfo_overlay_data(file_path)
                         if nfo_data:
                             play_duration = None
                             if file_duration is not None:
-                                play_duration = file_duration - (current_time or 0)
+                                play_duration = file_duration - (offset_seconds or 0)
+                            from fs42.nfo_agent import NFOAgent
                             self.now_playing_process = NFOAgent.show_overlay(nfo_data, play_duration=play_duration)
                     except Exception as e:
                         self._l.warning(f"Could not start NFO overlay: {e}")
@@ -459,6 +657,48 @@ class StationPlayer:
             )
             return False
 
+    def _seek_with_verify(self, file_path, offset_seconds, timeout_seconds,
+                          tolerance=1.0, verify_window=2.0, retry_delay=0.2):
+
+        def safe_prop(name, default=None):
+            try:
+                return getattr(self.mpv, name)
+            except Exception:
+                return default
+
+        deadline = time.time() + timeout_seconds
+        attempt = 0
+
+        while time.time() < deadline:
+            attempt += 1
+
+            try:
+                self.mpv.command("seek", offset_seconds, "absolute")
+            except Exception as e:
+                self._l.debug(f"Seek not accepted yet on {file_path}: {e} (attempt {attempt})")
+                time.sleep(retry_delay)
+                continue
+
+            patience = time.time() + verify_window
+            while time.time() < deadline:
+                pos = safe_prop("time_pos")
+                if pos is not None and abs(pos - offset_seconds) <= tolerance:
+                    self._l.info(f"Seek landed at {pos:.2f} (target {offset_seconds}, attempt {attempt})")
+                    return
+                if safe_prop("seeking"):
+                    patience = time.time() + verify_window
+                elif time.time() >= patience:
+                    break  # idle and not landed -> dropped, re-issue
+                time.sleep(0.05)
+
+            self._l.debug(f"Seek to {offset_seconds} on {file_path} did not land (attempt {attempt}); retrying")
+            time.sleep(retry_delay)
+
+        self._l.error(
+            f"Seek to {offset_seconds} on {file_path} failed to land within {timeout_seconds}s; "
+            f"playback may be starting from the wrong position"
+        )
+
     def play_and_wait(self, file_path):
         self._l.info(f"Play and wait on file {file_path}")
         self._close_now_playing()
@@ -469,11 +709,11 @@ class StationPlayer:
         self.mpv.loop_playlist = "inf"
         self.current_playing_file_path = file_path
 
-        # show NFO overlay if a sidecar file exists alongside the video
+        # show NFO overlay if the file has overlay-eligible cached metadata
         try:
-            from fs42.nfo_agent import NFOAgent
-            nfo_data = NFOAgent.read_nfo(file_path)
+            nfo_data = self._nfo_overlay_data(file_path)
             if nfo_data:
+                from fs42.nfo_agent import NFOAgent
                 self.now_playing_process = NFOAgent.show_overlay(nfo_data)
         except Exception as e:
             self._l.warning(f"Could not start NFO overlay: {e}")
@@ -484,6 +724,9 @@ class StationPlayer:
             response = self.input_check_fn()
             if response:
                 if self.handle_runtime_command_outcome(response):
+                    continue
+                if self.is_non_interrupting(response):
+                    self._l.debug(f"Ignoring non-interrupting command during playback: {response.payload}")
                     continue
                 self._close_now_playing()
                 return response
@@ -652,6 +895,9 @@ class StationPlayer:
             if response:
                 if self.handle_runtime_command_outcome(response):
                     continue
+                if self.is_non_interrupting(response):
+                    self._l.debug(f"Ignoring non-interrupting command on guide channel: {response.payload}")
+                    continue
                 self._l.info("Sending the guide channel shutdown command")
                 queue.put(GuideCommands.hide_window)
                 guide_process.join()
@@ -660,6 +906,12 @@ class StationPlayer:
         return PlayerOutcome(PlayerState.SUCCESS)
 
 
+    def stop_player(self):
+        try:
+            self.mpv.stop()
+            self.current_playing_file_path = None
+        except Exception:
+            self._l.error(f"Failed to stop player - might not be running")
 
     def show_web(self, web_config, blocking=True):
         if not WEB_RENDER_AVAILABLE:
@@ -667,9 +919,11 @@ class StationPlayer:
             msg = "Web rendering requires PySide6 to be installed and configured. Please check documentation."
             return PlayerOutcome(PlayerState.EXIT_COMMAND, msg)
 
+        ctx = multiprocessing.get_context("spawn")
+
         # create the pipe to communicate with the web channel
-        self.web_queue = multiprocessing.Queue()
-        self.web_process = multiprocessing.Process(
+        self.web_queue = ctx.Queue()
+        self.web_process = ctx.Process(
             target=web_render_runner,
             args=(
                 web_config,
@@ -735,6 +989,8 @@ class StationPlayer:
                     if self.web_queue:
                         self.web_queue.put(f"key:{key_name}")
                         self._l.info(f"Forwarded key '{key_name}' to web process")
+                elif self.is_non_interrupting(response):
+                    self._l.debug(f"Ignoring non-interrupting command on web channel: {response.payload}")
                 else:
                     self._l.info("Sending the web channel shutdown command")
                     self.web_queue.put("hide_window")
@@ -762,6 +1018,10 @@ class StationPlayer:
 
     def play_slot(self, network_name, when):
         liquid = LiquidManager()
+
+        if self._parental_controls_required(network_name):
+            if self.parental_unlocked_network != network_name:
+                return PlayerOutcome(PlayerState.PARENTAL_CONTROLS, network_name)
 
         try:
             play_point = liquid.get_play_point(network_name, when)
@@ -806,7 +1066,7 @@ class StationPlayer:
                 title = play_point.block_title
                 content_type = getattr(entry, 'content_type', 'feature')  # Get content_type from entry, default to 'feature'
                 media_type = getattr(entry, 'media_type', 'video')  # Get media_type from entry, default to 'video'
-                worked = self.play_file(entry.path, file_duration=entry.duration, current_time=total_skip, is_stream=is_stream, title=title, content_type=content_type, media_type=media_type)
+                worked = self.play_file(entry.path, file_duration=entry.duration, offset_seconds=total_skip, is_stream=is_stream, title=title, content_type=content_type, media_type=media_type)
                 if self._pending_response:
                     response = self._pending_response
                     self._pending_response = None
@@ -910,6 +1170,9 @@ class StationPlayer:
                             response = self.input_check_fn()
                             if response:
                                 if self.handle_runtime_command_outcome(response):
+                                    continue
+                                if self.is_non_interrupting(response):
+                                    self._l.debug(f"Ignoring non-interrupting command during slot: {response.payload}")
                                     continue
                                 if response.status == PlayerState.CHANNEL_CHANGE:
                                     if stream_is_down:
