@@ -189,7 +189,7 @@ def web_render_runner(user_conf, queue):
 
     # Set environment variables to enable autoplay
     import os
-    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--autoplay-policy=no-user-gesture-required --disable-web-security --allow-running-insecure-content --disable-features=VizDisplayCompositor'
+    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--autoplay-policy=no-user-gesture-required --disable-web-security --allow-running-insecure-content'
 
     # Set graphics API before creating QApplication
     QQuickWindow.setGraphicsApi(QSGRendererInterface.GraphicsApi.Software)

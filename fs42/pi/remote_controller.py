@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from evdev import InputDevice, ecodes
+from select import select
 import requests
 import os
 import subprocess
@@ -469,21 +470,23 @@ def toggle_services():
         print(f"Error toggling services: {e}")
 
 
-def find_input_device(device_spec=None):
-    """Find the Flirc or keyboard input device
+def find_input_devices(device_spec=None):
+    """Find the Flirc or keyboard input device(s)
 
     Args:
         device_spec: Optional device specifier. Can be:
             - Device path (e.g., '/dev/input/event3')
             - Device index (e.g., '0', '1', '2')
-            - Device name pattern (e.g., 'flirc', 'keyboard')
+            - Device name pattern (e.g., 'flirc', 'keyboard', 'XING WEI')
             - None to auto-detect
+    Returns:
+        List of device paths (e.g. ['/dev/input/event7', '/dev/input/event9']) or None
     """
     import glob
     devices = []
     default = False
     # Look for input devices
-    for device_path in glob.glob('/dev/input/event*'):
+    for device_path in sorted(glob.glob('/dev/input/event*')):
         try:
             device = InputDevice(device_path)
             # Look for devices that can send key events
@@ -506,7 +509,7 @@ def find_input_device(device_spec=None):
         if device_spec.startswith('/dev/input/'):
             if os.path.exists(device_spec):
                 print(f"Using specified device path: {device_spec}")
-                return device_spec
+                return [device_spec]
             else:
                 print(f"Warning: Device path '{device_spec}' not found, falling back to auto-detect")
 
@@ -516,7 +519,7 @@ def find_input_device(device_spec=None):
             if 0 <= index < len(devices):
                 path, name = devices[index]
                 print(f"Using device at index {index}: {name} ({path})")
-                return path
+                return [path]
             else:
                 print(f"Warning: Device index {index} out of range (0-{len(devices)-1}), falling back to auto-detect")
 
@@ -529,11 +532,17 @@ def find_input_device(device_spec=None):
         device_spec = "flirc"
         default = True
 
-    # Try to match requested device
+    # Try to match requested device pattern against all available devices
+    matched_paths = []
     for path, name in devices:
         if device_spec.lower() in name.lower():
-            print(f"Found device: {name}")
-            return path
+            matched_paths.append((path, name))
+
+    if matched_paths:
+        print(f"Found {len(matched_paths)} matching device(s) for '{device_spec}':")
+        for path, name in matched_paths:
+            print(f"  - {name} ({path})")
+        return [p[0] for p in matched_paths]
 
     # If user explicitly requested device, do NOT fallback
     if default is False and (device_spec or os.getenv('FS42_INPUT_DEVICE')):
@@ -542,13 +551,12 @@ def find_input_device(device_spec=None):
 
     # Otherwise fallback to first keyboard device
     print(f"Using default device: {devices[0][1]}")
-    return devices[0][0]
+    return [devices[0][0]]
 
 def get_key_name_from_code(key_code):
     """Convert evdev key code to readable key name"""
     key_map = {
         ecodes.KEY_HOME: 'home', ecodes.KEY_END: 'end',
-        ecodes.KEY_UP: 'up', ecodes.KEY_DOWN: 'down',
         ecodes.KEY_LEFT: 'left', ecodes.KEY_RIGHT: 'right',
         ecodes.KEY_SPACE: 'space', ecodes.KEY_ENTER: 'enter',
         ecodes.KEY_ESC: 'esc', ecodes.KEY_TAB: 'tab',
@@ -563,6 +571,20 @@ def get_key_name_from_code(key_code):
         ecodes.KEY_LEFTCTRL: 'leftctrl', ecodes.KEY_RIGHTCTRL: 'rightctrl',
         ecodes.KEY_LEFTALT: 'leftalt', ecodes.KEY_RIGHTALT: 'rightalt',
     }
+
+    # Custom ones
+    key_map[ecodes.KEY_VOLUMEUP] = 'right'
+    key_map[ecodes.KEY_VOLUMEDOWN] = 'left'
+    key_map[ecodes.KEY_RIGHT] = 'up'
+    key_map[ecodes.KEY_LEFT] = 'down'
+    key_map[ecodes.KEY_HOMEPAGE] = 'home'
+    key_map[ecodes.KEY_COMPOSE] = 'j'
+    key_map[ecodes.KEY_VOICECOMMAND] = 'a'
+    key_map[ecodes.KEY_MUTE] = 'm'
+    key_map[ecodes.KEY_BACK] = 'backspace'
+    key_map[ecodes.KEY_UP] = 'pageup'
+    key_map[ecodes.KEY_DOWN] = 'pagedown'
+    key_map[ecodes.KEY_SELECT] = 'enter'
 
     # Add letter keys a-z using ecodes constants
     key_map[ecodes.KEY_A] = 'a'
@@ -747,8 +769,8 @@ def main():
 Device specification examples:
   -d /dev/input/event3      Use specific device path
   -d 0                      Use device at index 0 from the device list
-  -d flirc                  Use first device with 'flirc' in its name
-  -d keyboard               Use first device with 'keyboard' in its name
+  -d flirc                  Use all devices with 'flirc' in their name
+  -d "XING WEI"             Use all devices with 'XING WEI' in their name
   -d test                   Run test mode
 
 Environment variables:
@@ -777,50 +799,71 @@ Environment variables:
 
     # If --list-devices, just show devices and exit
     if args.list_devices:
-        find_input_device(device_spec)
+        find_input_devices(device_spec)
         return
 
-    # Find input device
+    # Find input device(s)
+    device_paths = None
     if device_spec != "test":
-        device_path = find_input_device(device_spec)
+        device_paths = find_input_devices(device_spec)
     else:
         test_mode()
+        return
 
     print("Press ESC to exit.")
     
-    first_run = True
     while True:
+        devices = []
         try:
-            if not device_path:
-                print("Selected input not found. Retrying in 5 seconds...")
+            if not device_paths:
+                print("Selected input device(s) not found. Retrying in 5 seconds...")
                 time.sleep(5)
                 # Check if the device has reconnected
-                device_path = find_input_device(device_spec)
+                device_paths = find_input_devices(device_spec)
 
-                if not device_path:
+                if not device_paths:
                     continue
 
-            device = InputDevice(device_path)
+            devices = [InputDevice(path) for path in device_paths]
+            devices_map = {dev.fd: dev for dev in devices}
 
-            print(f"Listening for remote control commands from: {device.name}")
+            print(f"Listening for remote control commands from {len(devices)} device(s):")
+            for dev in devices:
+                print(f"  - {dev.name} ({dev.path})")
 
-            # Main event loop
-            for event in device.read_loop():
-                if not handle_key_event(event):
-                    return
+            # Main event loop multiplexed with select
+            while True:
+                r, _, _ = select(devices_map.keys(), [], [], 0.5)
+                for fd in r:
+                    dev = devices_map[fd]
+                    try:
+                        for event in dev.read():
+                            if not handle_key_event(event):
+                                return
+                    except (BlockingIOError, IOError) as e:
+                        # Ignore non-blocking read race conditions
+                        if isinstance(e, OSError) and e.errno in (11, 35):
+                            pass
+                        elif isinstance(e, BlockingIOError):
+                            pass
+                        else:
+                            raise
 
         except OSError as e:
             # Bluetooth disconnect / USB unplug / device vanished
             if e.errno == 19 or e.errno == 2:
                 print("Input device disconnected. Waiting for reconnection...")
                 time.sleep(5)
+                device_paths = None
             else:
                 print(f"Device error: {e}")
                 time.sleep(5)
+                device_paths = None
 
         except FileNotFoundError:
             print("Input device missing. Waiting for reconnection...")
             time.sleep(5)
+            device_paths = None
 
         except PermissionError:
             print("Permission denied. Try running with: sudo python3 remote_controller.py")
@@ -833,6 +876,12 @@ Environment variables:
         except Exception as e:
             print(f"Error: {e}")
             sys.exit(1)
+        finally:
+            for dev in devices:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
 
 
 
