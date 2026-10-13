@@ -415,8 +415,9 @@ def ppv_up():
         return  # Debounced - ignore this press
 
     global current_channel
+    channel_num = current_channel or 1
     try:
-        response = requests.get(f'{FS42_BASE_URL}/ppv/{current_channel}/key/PageUp')
+        response = requests.post(f'{FS42_BASE_URL}/ppv/{channel_num}/key/PageUp')
         if response.ok:
             print("PPV up sent")
         else:
@@ -431,8 +432,9 @@ def ppv_down():
         return  # Debounced - ignore this press
 
     global current_channel
+    channel_num = current_channel or 1
     try:
-        response = requests.get(f'{FS42_BASE_URL}/ppv/{current_channel}/key/PageDown')
+        response = requests.post(f'{FS42_BASE_URL}/ppv/{channel_num}/key/PageDown')
         if response.ok:
             print("PPV down sent")
         else:
@@ -446,8 +448,9 @@ def ppv_enter():
         return  # Debounced - ignore this press
 
     global current_channel
+    channel_num = current_channel or 1
     try:
-        response = requests.get(f'{FS42_BASE_URL}/ppv/{current_channel}/key/Enter')
+        response = requests.post(f'{FS42_BASE_URL}/ppv/{channel_num}/key/Enter')
         if response.ok:
             print("PPV enter sent")
         else:
