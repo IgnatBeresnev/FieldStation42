@@ -416,7 +416,7 @@ def ppv_up():
 
     global current_channel
     try:
-        response = requests.get(f'{FS42_BASE_URL}/ppv/{current_channel}/PageUp')
+        response = requests.get(f'{FS42_BASE_URL}/ppv/{current_channel}/key/PageUp')
         if response.ok:
             print("PPV up sent")
         else:
@@ -432,7 +432,7 @@ def ppv_down():
 
     global current_channel
     try:
-        response = requests.get(f'{FS42_BASE_URL}/ppv/{current_channel}/PageDown')
+        response = requests.get(f'{FS42_BASE_URL}/ppv/{current_channel}/key/PageDown')
         if response.ok:
             print("PPV down sent")
         else:
@@ -447,7 +447,7 @@ def ppv_enter():
 
     global current_channel
     try:
-        response = requests.get(f'{FS42_BASE_URL}/ppv/{current_channel}/Enter')
+        response = requests.get(f'{FS42_BASE_URL}/ppv/{current_channel}/key/Enter')
         if response.ok:
             print("PPV enter sent")
         else:
