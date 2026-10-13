@@ -52,6 +52,10 @@ DEFAULT_KEY_MAPPINGS = {
     'power_stop': 'end',         # Stop player (power button)
     'exit': 'esc',               # Exit remote controller
 
+    'ppv_up': 'pageup',
+    'ppv_down': 'pagedown',
+    'ppv_enter': 'enter',
+
     # Alternative mappings (uncomment to use):
     # 'power_stop': 'space',     # Use spacebar for power/stop
     # 'show_guide': 'g',         # Use 'g' key for guide
@@ -405,6 +409,52 @@ def last_channel_pressed():
     else:
         print("No last channel stored")
 
+def ppv_up():
+    """Handle PPV up key press"""
+    if not should_allow_press('ppv_up'):
+        return  # Debounced - ignore this press
+
+    global current_channel
+    try:
+        response = requests.get(f'{FS42_BASE_URL}/ppv/{current_channel}/PageUp')
+        if response.ok:
+            print("PPV up sent")
+        else:
+            print("PPV up request failed")
+    except Exception as e:
+        print(f"PPV up error: {e}")
+
+
+def ppv_down():
+    """Handle PPV down key press"""
+    if not should_allow_press('ppv_down'):
+        return  # Debounced - ignore this press
+
+    global current_channel
+    try:
+        response = requests.get(f'{FS42_BASE_URL}/ppv/{current_channel}/PageDown')
+        if response.ok:
+            print("PPV down sent")
+        else:
+            print("PPV down request failed")
+    except Exception as e:
+        print(f"PPV down error: {e}")
+
+def ppv_enter():
+    """Handle PPV enter key press"""
+    if not should_allow_press('ppv_enter'):
+        return  # Debounced - ignore this press
+
+    global current_channel
+    try:
+        response = requests.get(f'{FS42_BASE_URL}/ppv/{current_channel}/Enter')
+        if response.ok:
+            print("PPV enter sent")
+        else:
+            print("PPV enter request failed")
+    except Exception as e:
+        print(f"PPV enter error: {e}")
+
 
 def end_pressed():
     """Handle end key press - stop the player"""
@@ -652,6 +702,12 @@ def handle_key_name(key_name):
             elif function_name == 'exit':
                 print("Exiting remote controller...")
                 return False
+            elif function_name == 'ppv_up':
+                ppv_up()
+            elif function_name == 'ppv_down':
+                ppv_down()
+            elif function_name == 'ppv_enter':
+                ppv_enter()
             break
 
     if key_name in exec_mappings:
