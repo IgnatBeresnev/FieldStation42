@@ -186,3 +186,8 @@ hls/
 web_urls/
 
 .fuse_hidden*
+
+# Custom IgnatBeresnev
+logs
+scripts
+catalog

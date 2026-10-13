@@ -557,6 +557,7 @@ def get_key_name_from_code(key_code):
     """Convert evdev key code to readable key name"""
     key_map = {
         ecodes.KEY_HOME: 'home', ecodes.KEY_END: 'end',
+        ecodes.KEY_UP: 'pageup', ecodes.KEY_DOWN: 'pagedown',
         ecodes.KEY_LEFT: 'left', ecodes.KEY_RIGHT: 'right',
         ecodes.KEY_SPACE: 'space', ecodes.KEY_ENTER: 'enter',
         ecodes.KEY_ESC: 'esc', ecodes.KEY_TAB: 'tab',
