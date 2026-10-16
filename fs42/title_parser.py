@@ -48,6 +48,8 @@ class TitleParser:
 
         # Default built-in patterns
         default_patterns = [
+            # Custom: like the one below, but it leaves the season and episode info in the title
+            (r"^(.+?" + sep + r"(?:[sS]\d+(?:" + sep + r"?[eE]\d+)+|)[sS]\d+[eE]\d+(?:[eE]\d+)*|\d+[xX]\d+)(?:" + sep + r".*)?$", 1),
             # Title + separators + "Title" + number suffix (e.g., "Show Name - Title1", "Show Name TITLE2")
             (r"^(.+?)" + sep + r"[tT][iI][tT][lL][eE]\d+$", 1),
             # [Group] Title - Episode (release group prefix)
@@ -56,8 +58,6 @@ class TitleParser:
             (r"^(.+?)\s*\(\d{4}\)$", 1),
             # Title + separators + season/episode pattern + optional extra (including duplicate episodes like s01e03e03)
             (r"^(.+?)" + sep + r"(?:[sS]\d+(?:" + sep + r"?[eE]\d+)+|[sS]\d+[eE]\d+(?:[eE]\d+)*|\d+[xX]\d+)(?:" + sep + r".*)?$", 1),
-            # Like the one above, but captures season and episode into the group
-            (r"^(.+?" + sep + r"(?:[sS]\d+(?:" + sep + r"?[eE]\d+)+|)[sS]\d+[eE]\d+(?:[eE]\d+)*|\d+[xX]\d+)(?:" + sep + r".*)?$", 1),
             # Title (Year) + separators + season/episode pattern + separators + episode name + separators + extras
             (
                 r"^(.+?)(?:\s\(\d{4}\))"
