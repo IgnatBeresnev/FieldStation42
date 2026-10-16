@@ -56,6 +56,8 @@ class TitleParser:
             (r"^(.+?)\s*\(\d{4}\)$", 1),
             # Title + separators + season/episode pattern + optional extra (including duplicate episodes like s01e03e03)
             (r"^(.+?)" + sep + r"(?:[sS]\d+(?:" + sep + r"?[eE]\d+)+|[sS]\d+[eE]\d+(?:[eE]\d+)*|\d+[xX]\d+)(?:" + sep + r".*)?$", 1),
+            # Like the one above, but captures season and episode into the group
+            (r"^(.+?" + sep + r"(?:[sS]\d+(?:" + sep + r"?[eE]\d+)+|)[sS]\d+[eE]\d+(?:[eE]\d+)*|\d+[xX]\d+)(?:" + sep + r".*)?$", 1),
             # Title (Year) + separators + season/episode pattern + separators + episode name + separators + extras
             (
                 r"^(.+?)(?:\s\(\d{4}\))"
