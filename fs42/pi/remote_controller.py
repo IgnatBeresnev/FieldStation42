@@ -42,7 +42,8 @@ if FS42_API_KEY:
     api.headers['X-API-Key'] = FS42_API_KEY
 
 # Debounce Configuration - Time in seconds to wait between repeated button presses
-DEBOUNCE_TIME = 0.25  # 250ms default debounce time
+# 250ms default, 100ms custom
+DEBOUNCE_TIME = 0.10
 
 # Services to toggle when power button is pressed (remote-controller is never toggled)
 SYSTEMCTL_TO_TOGGLE = [
