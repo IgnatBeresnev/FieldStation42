@@ -46,9 +46,23 @@ class SequenceAPI:
         return seq
 
     @staticmethod
+    def peek_next_in_sequence(station_config, sequence_name, tag_path) -> SequenceEntry:
+        # next entry without advancing; None at the end so a wrap or child switch waits for the next increment
+        seq = SequenceAPI.get_sequence(station_config, sequence_name, tag_path)
+
+        if not seq or not SequenceAPI._normalize_sequence_position(seq):
+            return None
+
+        if seq.current_index < seq.end_index:
+            return seq.episodes[seq.current_index]
+
+        return None
+
+    @staticmethod
     def get_next_in_sequence(station_config, sequence_name, tag_path) -> SequenceEntry:
         _l = logging.getLogger("SEQUENCE")
         sio = SequenceIO()
+        root_tag_path = tag_path
         tag_path = SequenceAPI._get_active_child_sequence(
             station_config,
             sequence_name,
@@ -74,7 +88,7 @@ class SequenceAPI:
                 f"Sequence completed: "
                 f"{sequence_name}:{seq.tag_path}"
             )
-            parent_tag = seq.tag_path.rsplit("/",1)[0]
+            parent_tag = root_tag_path
 
             children = sio.get_child_sequences(
                 station_config["network_name"],
@@ -82,6 +96,13 @@ class SequenceAPI:
                 parent_tag
             )
 
+            _l.debug(
+                f"Current index {seq.current_index} reached end of sequence "
+                f"{sequence_name}. Looping back to {seq.start_index}."
+            )
+            seq.current_index = seq.start_index
+            sio.update_current_index(station_config["network_name"], sequence_name, tag_path, seq.current_index)
+            
             if children:
 
                 next_child = SequenceAPI._choose_next_child_sequence(
@@ -133,12 +154,6 @@ class SequenceAPI:
 
                 return next_entry
             
-            _l.debug(
-                f"Current index {seq.current_index} reached end of sequence "
-                f"{sequence_name}. Looping back to {seq.start_index}."
-            )
-            seq.current_index = seq.start_index
-
         try:
             next_entry = seq.episodes[seq.current_index]
         except IndexError:

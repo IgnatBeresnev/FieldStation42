@@ -1,5 +1,6 @@
 import datetime
 import logging
+import math
 import os.path
 import sys
 import random
@@ -7,6 +8,7 @@ from pathlib import Path
 
 from fs42.catalog_entry import CatalogEntry, MatchingContentNotFound, NoFillerContentFound
 from fs42.catalog_api import CatalogAPI
+from fs42.build_lock import station_build_lock
 from fs42.hint_agent import HintAgent
 from fs42.timings import MIN_5, DAYS
 from fs42.liquid_blocks import ReelBlock
@@ -14,20 +16,6 @@ from fs42.media_processor import MediaProcessor
 from fs42.sequence_api import SequenceAPI
 from fs42.autobump_agent import AutoBumpAgent
 from fs42.slot_reader import SlotReader
-
-
-
-try:
-    try:
-        # try to import from version > 2.0
-        from moviepy import VideoFileClip
-    except ImportError:
-        # fall back to import from version 1.0
-        from moviepy.editor import VideoFileClip  # type: ignore
-except ImportError:
-    # moviepy not installed at all - it's only used as a fallback duration
-    # probe when ffmpeg.probe() can't determine a file's duration
-    VideoFileClip = None
 
 
 FF_USE_FLUID_FILE_CACHE = True
@@ -73,16 +61,6 @@ class ShowCatalog:
         if duration > 0.0:
             return duration
 
-        if VideoFileClip is not None:
-            try:
-                video_clip = VideoFileClip(path)
-                duration = video_clip.duration
-                video_clip.close()
-                if duration and duration > 0.0:
-                    return duration
-            except Exception:
-                pass
-
         hint = f" ({error_hint})" if error_hint else ""
         raise RuntimeError(f"Could not determine duration for required video file: {path}{hint}")
 
@@ -102,10 +80,11 @@ class ShowCatalog:
         self.min_gap = 3
         self.skip_chapter_scan = skip_chapter_scan
         if rebuild_catalog:
-            if force:
-                self._l.info("Rebuilding catalog with force flag - will delete existing catalog")
-                CatalogAPI.delete_catalog(self.config)
-            self.build_catalog()
+            with station_build_lock(self.config["network_name"]):
+                if force:
+                    self._l.info("Rebuilding catalog with force flag - will delete existing catalog")
+                    CatalogAPI.delete_catalog(self.config)
+                self.build_catalog()
         elif load:
             self.load_catalog()
 
@@ -183,6 +162,21 @@ class ShowCatalog:
         self.tags = list(self.clip_index.keys())
 
     @staticmethod
+    def _unpack_bump_dir(spec):
+        """Validate a bump source without sampling it during catalog harvesting."""
+        if spec is None or isinstance(spec, str):
+            return spec, 1
+        if isinstance(spec, dict) and set(spec) <= {"tags", "chance"} and isinstance(spec.get("tags"), str):
+            chance = spec.get("chance", 1)
+            if type(chance) in (int, float) and math.isfinite(chance) and 0 <= chance <= 1:
+                return spec["tags"], chance
+        raise ValueError(
+            f"Invalid bump specification {spec!r}: expected a directory string or "
+            '{"tags": directory, "chance": probability} with an optional finite '
+            "numeric chance between 0 and 1"
+        )
+
+    @staticmethod
     def _harvest_slot(slot, tags, bump_overrides, commercial_overrides, start_bumps, end_bumps):
         # collects the tags and directory overrides declared by a single slot
         if "tags" in slot:
@@ -193,7 +187,9 @@ class ShowCatalog:
                 tags[slot["tags"]] = True
 
         if "bump_dir" in slot:
-            bump_overrides[slot["bump_dir"]] = True
+            bump_dir, _ = ShowCatalog._unpack_bump_dir(slot["bump_dir"])
+            if bump_dir:
+                bump_overrides[bump_dir] = True
         if "commercial_dir" in slot:
             commercial_overrides[slot["commercial_dir"]] = True
         if "start_bump" in slot:
@@ -232,7 +228,9 @@ class ShowCatalog:
         tag_overrides = self.config.get("tag_overrides", {})
         for override in tag_overrides.values():
             if "bump_dir" in override:
-                bump_overrides[override["bump_dir"]] = True
+                bump_dir, _ = self._unpack_bump_dir(override["bump_dir"])
+                if bump_dir:
+                    bump_overrides[bump_dir] = True
             if "commercial_dir" in override:
                 commercial_overrides[override["commercial_dir"]] = True
             if "start_bump" in override:
@@ -303,7 +301,8 @@ class ShowCatalog:
             total_count += self._scan_directory(self.config["bump_dir"], is_bumps=True, content_type="bump")
 
         for override_dir in bump_overrides:
-            total_count += self._scan_directory(override_dir, is_bumps=True, content_type="bump")
+            if override_dir != self.config.get("bump_dir"):
+                total_count += self._scan_directory(override_dir, is_bumps=True, content_type="bump")
 
         for override_dir in commercial_overrides:
             total_count += self._scan_directory(override_dir, content_type="commercial")
@@ -533,7 +532,7 @@ class ShowCatalog:
         else:
             return None
 
-    def find_candidate(self, tag, seconds, when, exclusion_index=None, proposed_start=None, meta_hints=None):
+    def find_candidate(self, tag, seconds, when, exclusion_index=None, proposed_start=None, meta_hints=None, min_duration=None, max_duration=None, candidate_filter=None):
         """Find the best candidate for a given tag and duration.
 
         exclusion_index: optional dict of {realpath: [(start, end), ...]} built from
@@ -555,6 +554,8 @@ class ShowCatalog:
                 # restrict content to fit and be valid (zero duration is likely not valid)
                 if (
                     seconds > candidate.duration >= 1
+                        and (min_duration is None or candidate.duration >= min_duration)
+                        and (max_duration is None or candidate.duration <= max_duration)
                         and MediaProcessor._test_candidate_hints(candidate.hints, when)
                 ):
                     # skip if a sibling channel is already playing this file in an
@@ -571,10 +572,20 @@ class ShowCatalog:
                             for w_start, w_end in exclusion_index[candidate.realpath]
                         ):
                             continue
+                    if candidate_filter and not candidate_filter(candidate):
+                        continue
                     matches.append(candidate)
             #random.shuffle(matches)
             if not len(matches):
-                err = f"Could not find candidate video for tag={tag} under {seconds} in len - maybe add some shorter content?"
+                if min_duration is not None or max_duration is not None:
+                    low = f"{min_duration / 60:g}" if min_duration is not None else "0"
+                    high = f"{max_duration / 60:g}" if max_duration is not None else "any"
+                    err = (
+                        f"Could not find candidate video for tag={tag} between {low} and {high} minutes "
+                        f"- check the slot's min_duration/max_duration or add content in that range"
+                    )
+                else:
+                    err = f"Could not find candidate video for tag={tag} under {seconds} in len - maybe add some shorter content?"
                 raise (MatchingContentNotFound(err))
             result = self._lowest_count(matches)
             # note, this has been migrated
@@ -592,7 +603,8 @@ class ShowCatalog:
         return candidates
 
     def find_bump(self, seconds, when, position=None, bump_tag=None, lookahead=None):
-        if not bump_tag:
+        bump_tag, probability = self._unpack_bump_dir(bump_tag)
+        if not bump_tag or probability == 0 or (probability < 1 and random.random() >= probability):
             bump_tag = self.config["bump_dir"]
 
         if position:
