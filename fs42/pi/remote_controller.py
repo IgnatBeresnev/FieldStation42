@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 from evdev import InputDevice, ecodes
-from select import select
 import requests
 import os
 import subprocess
@@ -587,6 +586,33 @@ def find_input_device(device_spec=None):
     return devices[0][0]
 
 def get_key_name_from_code(key_code):
+
+    # Custom keys for the remote
+    if key_code == ecodes.KEY_VOLUMEUP:
+        return 'right'
+    elif key_code == ecodes.KEY_VOLUMEDOWN:
+        return 'left'
+    elif key_code == ecodes.KEY_RIGHT:
+        return 'up'
+    elif key_code == ecodes.KEY_LEFT:
+        return 'down'
+    elif key_code == ecodes.KEY_HOMEPAGE:
+        return 'home'
+    elif key_code == ecodes.KEY_COMPOSE:
+        return 'j'
+    elif key_code == ecodes.KEY_VOICECOMMAND:
+        return 'a'
+    elif key_code == ecodes.KEY_MUTE:
+        return 'm'
+    elif key_code == ecodes.KEY_BACK:
+        return 'backspace'
+    elif key_code == ecodes.KEY_UP:
+        return 'pageup'
+    elif key_code == ecodes.KEY_DOWN:
+        return 'pagedown'
+    elif key_code == ecodes.KEY_SELECT:
+        return 'enter'
+
     name = ecodes.KEY.get(key_code)
 
     #print(f"Key code: {key_code}")
